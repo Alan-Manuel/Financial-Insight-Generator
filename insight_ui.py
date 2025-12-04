@@ -1,62 +1,75 @@
-# insight_ui.py
 import streamlit as st
 import pandas as pd
+import matplotlib.pyplot as plt
 from sklearn.ensemble import IsolationForest
 from sklearn.cluster import KMeans
 
 # Streamlit Page Setup
 st.set_page_config(page_title="💸 Financial Insight Generator", layout="centered")
 st.title("💸 Financial Insight Generator")
-st.markdown("Upload a CSV of your transactions to receive automated insights.")
+st.markdown("Upload a CSV of your transactions to receive automated insights and visual analytics.")
 
 # Function to analyze transaction data
 def analyze_transactions(df: pd.DataFrame):
     result = []
 
-    # Run Isolation Forest for anomaly detection
+    # Isolation Forest for anomaly detection
     iso = IsolationForest(contamination=0.05, random_state=42)
     df["anomaly_score"] = iso.fit_predict(df[["Amount"]])
 
-    # Run KMeans Clustering
+    # KMeans Clustering
     kmeans = KMeans(n_clusters=3, random_state=42)
     df["cluster"] = kmeans.fit_predict(df[["Amount"]])
 
-    # Flag high-value outliers
+    # Detect high spenders
     high_spend = df[df["Amount"] > df["Amount"].mean() + 2 * df["Amount"].std()]
     if not high_spend.empty:
-        result.append(f"⚠️ Detected {len(high_spend)} unusually high-value transactions.")
+        result.append(f"⚠️ **{len(high_spend)} unusually high-value transactions** detected.")
 
-    # Summary metrics
+    # Summary
     total_spent = df["Amount"].sum()
     avg_spent = df["Amount"].mean()
-    result.append(f"💰 Total Spending: ${total_spent:.2f}")
-    result.append(f"📊 Average Transaction: ${avg_spent:.2f}")
+    result.append(f"💰 **Total Spending:** ${total_spent:,.2f}")
+    result.append(f"📊 **Average Transaction:** ${avg_spent:,.2f}")
+    result.append("🧠 _Insight_: Consider setting alerts for outlier spending to manage finances better.")
 
-    # Optional: Placeholder LLM-style insight
-    result.append("🧠 Insight: Consider setting alerts for outlier spending to manage finances better.")
-
-    return result
+    return result, df
 
 # Upload UI
-uploaded_file = st.file_uploader("Upload Transaction CSV", type=["csv"])
+uploaded_file = st.file_uploader("📄 Upload Transaction CSV", type=["csv"])
 
 if uploaded_file:
     try:
         df = pd.read_csv(uploaded_file)
 
-        # Basic validation
         if "Amount" not in df.columns:
             st.error("❌ The uploaded file must contain an 'Amount' column.")
         else:
-            st.subheader("Preview of Uploaded Data")
+            st.subheader("📋 Preview of Uploaded Data")
             st.dataframe(df.head())
 
-            # Trigger analysis
-            if st.button("Generate Insights"):
+            st.write(f"✅ **Total Rows:** {df.shape[0]} | **Columns:** {df.shape[1]}")
+
+            if st.button("🔍 Generate Insights"):
                 with st.spinner("Analyzing your transactions..."):
-                    insights = analyze_transactions(df)
-                    st.success("Insights Generated:")
+                    insights, df = analyze_transactions(df)
+
+                    st.subheader("📈 Summary Metrics")
+                    col1, col2, col3 = st.columns(3)
+                    col1.metric("Total Transactions", f"{df.shape[0]}")
+                    col2.metric("Total Spending", f"${df['Amount'].sum():,.2f}")
+                    col3.metric("Avg Transaction", f"${df['Amount'].mean():,.2f}")
+
+                    st.subheader("📊 Distribution of Transaction Amounts")
+                    fig, ax = plt.subplots()
+                    ax.hist(df["Amount"], bins=30, color="skyblue", edgecolor="black")
+                    ax.set_xlabel("Transaction Amount")
+                    ax.set_ylabel("Frequency")
+                    st.pyplot(fig)
+
+                    st.subheader("🧠 Key Insights")
+                    st.info("Here's what we found from your data:")
                     for insight in insights:
-                        st.write(insight)
+                        st.markdown(f"- {insight}")
     except Exception as e:
         st.error(f"⚠️ Error processing file: {e}")

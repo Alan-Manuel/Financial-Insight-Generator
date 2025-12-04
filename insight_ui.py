@@ -54,19 +54,42 @@ if uploaded_file:
                 with st.spinner("Analyzing your transactions..."):
                     insights, df = analyze_transactions(df)
 
+                    # Summary Metrics
                     st.subheader("📈 Summary Metrics")
                     col1, col2, col3 = st.columns(3)
                     col1.metric("Total Transactions", f"{df.shape[0]}")
                     col2.metric("Total Spending", f"${df['Amount'].sum():,.2f}")
                     col3.metric("Avg Transaction", f"${df['Amount'].mean():,.2f}")
 
+                    # Chart 1: Histogram
                     st.subheader("📊 Distribution of Transaction Amounts")
-                    fig, ax = plt.subplots()
-                    ax.hist(df["Amount"], bins=30, color="skyblue", edgecolor="black")
-                    ax.set_xlabel("Transaction Amount")
-                    ax.set_ylabel("Frequency")
-                    st.pyplot(fig)
+                    fig1, ax1 = plt.subplots()
+                    ax1.hist(df["Amount"], bins=30, color="skyblue", edgecolor="black")
+                    ax1.set_xlabel("Transaction Amount")
+                    ax1.set_ylabel("Frequency")
+                    st.pyplot(fig1)
 
+                    # Chart 2: Boxplot
+                    st.subheader("📦 Transaction Value Spread (Boxplot)")
+                    fig2, ax2 = plt.subplots()
+                    ax2.boxplot(df["Amount"], vert=False)
+                    ax2.set_xlabel("Amount")
+                    st.pyplot(fig2)
+
+                    # Chart 3: Cluster Scatter Plot
+                    st.subheader("🎯 Transaction Clustering via KMeans")
+                    fig3, ax3 = plt.subplots()
+                    colors = {0: "blue", 1: "green", 2: "red"}
+                    for cluster in df["cluster"].unique():
+                        cluster_data = df[df["cluster"] == cluster]
+                        ax3.scatter(cluster_data.index, cluster_data["Amount"],
+                                    label=f"Cluster {cluster}", color=colors.get(cluster, "gray"))
+                    ax3.set_xlabel("Transaction Index")
+                    ax3.set_ylabel("Amount")
+                    ax3.legend()
+                    st.pyplot(fig3)
+
+                    # Insights
                     st.subheader("🧠 Key Insights")
                     st.info("Here's what we found from your data:")
                     for insight in insights:

@@ -69,25 +69,38 @@ if uploaded_file:
                     ax1.set_ylabel("Frequency")
                     st.pyplot(fig1)
 
-                    # Chart 2: Boxplot
-                    st.subheader("📦 Transaction Value Spread (Boxplot)")
-                    fig2, ax2 = plt.subplots()
-                    ax2.boxplot(df["Amount"], vert=False)
-                    ax2.set_xlabel("Amount")
-                    st.pyplot(fig2)
+                   # Chart 2: Enhanced Boxplot
+st.subheader("📦 Transaction Value Spread (Boxplot)")
+fig2, ax2 = plt.subplots(figsize=(10, 2))  # Wider and shorter
+ax2.boxplot(df["Amount"], vert=False, patch_artist=True,
+            boxprops=dict(facecolor='lightblue', color='black'),
+            medianprops=dict(color='red'),
+            notch=True)
+ax2.set_xlabel("Amount ($)")
+ax2.set_title("Boxplot of Transaction Amounts", fontsize=12)
+st.pyplot(fig2)
+
 
                     # Chart 3: Cluster Scatter Plot
-                    st.subheader("🎯 Transaction Clustering via KMeans")
-                    fig3, ax3 = plt.subplots()
-                    colors = {0: "blue", 1: "green", 2: "red"}
-                    for cluster in df["cluster"].unique():
-                        cluster_data = df[df["cluster"] == cluster]
-                        ax3.scatter(cluster_data.index, cluster_data["Amount"],
-                                    label=f"Cluster {cluster}", color=colors.get(cluster, "gray"))
-                    ax3.set_xlabel("Transaction Index")
-                    ax3.set_ylabel("Amount")
-                    ax3.legend()
-                    st.pyplot(fig3)
+                   # Chart 3: Enhanced Cluster Scatter Plot
+st.subheader("🎯 Transaction Clustering via KMeans")
+fig3, ax3 = plt.subplots(figsize=(10, 4))  # Bigger size for spacing
+colors = {0: "blue", 1: "green", 2: "red"}
+
+for cluster in df["cluster"].unique():
+    cluster_data = df[df["cluster"] == cluster]
+    ax3.scatter(cluster_data.index, cluster_data["Amount"],
+                label=f"Cluster {cluster}",
+                color=colors.get(cluster, "gray"),
+                s=40, alpha=0.7, edgecolors='k')
+
+ax3.set_xlabel("Transaction Index")
+ax3.set_ylabel("Amount ($)")
+ax3.set_title("KMeans Clustering of Transaction Amounts")
+ax3.grid(True, linestyle='--', alpha=0.5)
+ax3.legend(title="Clusters", loc="upper right", fontsize="small")
+st.pyplot(fig3)
+
 
                     # Insights
                     st.subheader("🧠 Key Insights")

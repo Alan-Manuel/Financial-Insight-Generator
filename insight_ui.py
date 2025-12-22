@@ -1,13 +1,12 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt  # optional (you can remove if you want)
+import matplotlib.pyplot as plt  # optional (not used below; you can remove if you want)
 
 from sklearn.ensemble import IsolationForest
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 
-from fpdf import FPDF
 import plotly.express as px
 
 
@@ -45,37 +44,6 @@ def cap_for_chart(series: pd.Series, q: float) -> pd.Series:
     """Cap extreme values for plots only (winsorize)."""
     cap = series.quantile(q)
     return np.minimum(series, cap)
-
-
-# -----------------------------
-# PDF helpers (safe wrapping + encoding)
-# -----------------------------
-def _wrap_hard(text: str, width: int = 60) -> str:
-    """Hard-wrap every N characters so FPDF never sees an unbreakable long token."""
-    text = str(text)
-    return "\n".join(text[i:i + width] for i in range(0, len(text), width))
-
-
-def _pdf_safe(text: str) -> str:
-    """Make text safe for FPDF (wrap + latin-1 replace)."""
-    wrapped = _wrap_hard(text, width=60)
-    return wrapped.encode("latin-1", "replace").decode("latin-1")
-
-
-def insights_to_pdf_bytes(title: str, lines: list[str]) -> bytes:
-    pdf = FPDF()
-    pdf.add_page()
-    pdf.set_auto_page_break(auto=True, margin=12)
-
-    pdf.set_font("Helvetica", style="B", size=14)
-    pdf.multi_cell(0, 8, _pdf_safe(title))
-    pdf.ln(2)
-
-    pdf.set_font("Helvetica", size=11)
-    for line in lines:
-        pdf.multi_cell(0, 6, _pdf_safe(f"- {line}"))
-
-    return pdf.output(dest="S").encode("latin-1")
 
 
 # -----------------------------
@@ -228,41 +196,8 @@ try:
         st.dataframe(df_out.sort_values("Amount", ascending=False).head(20))
 
         st.subheader("Flagged Anomalies (Top 50)")
-        anomalies_df = (
-            df_out[df_out["anomaly_flag"] == 1]
-            .sort_values("Amount", ascending=False)
-            .head(50)
-        )
+        anomalies_df = df_out[df_out["anomaly_flag"] == 1].sort_values("Amount", ascending=False).head(50)
         st.dataframe(anomalies_df)
-
-        # -----------------------------
-        # PDF Export (below anomalies)
-        # -----------------------------
-        st.subheader("Download Report (PDF)")
-
-        pdf_lines = [
-            f"Transactions: {df_out.shape[0]:,}",
-            f"Total Spending: ${df_out['Amount'].sum():,.2f}",
-            f"Avg Amount: ${df_out['Amount'].mean():,.2f}",
-            f"Anomalies: {int(df_out['anomaly_flag'].sum()):,}",
-        ] + insights
-
-        try:
-            pdf_bytes = insights_to_pdf_bytes(
-                "Financial Insight Generator Report",
-                pdf_lines
-            )
-
-            st.download_button(
-                label="Download PDF report",
-                data=pdf_bytes,
-                file_name="financial_insights_report.pdf",
-                mime="application/pdf",
-            )
-
-        except Exception as pdf_err:
-            st.error("PDF generation failed (analysis still completed).")
-            st.caption(f"PDF error: {pdf_err}")
 
 except Exception as e:
     st.error(f"Error processing file: {e}")

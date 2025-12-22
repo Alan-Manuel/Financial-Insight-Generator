@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt  # optional now (can remove if you want)
+import matplotlib.pyplot as plt  # optional (you can remove if you want)
 
 from sklearn.ensemble import IsolationForest
 from sklearn.cluster import KMeans
@@ -228,7 +228,11 @@ try:
         st.dataframe(df_out.sort_values("Amount", ascending=False).head(20))
 
         st.subheader("Flagged Anomalies (Top 50)")
-        anomalies_df = df_out[df_out["anomaly_flag"] == 1].sort_values("Amount", ascending=False).head(50)
+        anomalies_df = (
+            df_out[df_out["anomaly_flag"] == 1]
+            .sort_values("Amount", ascending=False)
+            .head(50)
+        )
         st.dataframe(anomalies_df)
 
         # -----------------------------
@@ -243,14 +247,22 @@ try:
             f"Anomalies: {int(df_out['anomaly_flag'].sum()):,}",
         ] + insights
 
-        pdf_bytes = insights_to_pdf_bytes("Financial Insight Generator Report", pdf_lines)
+        try:
+            pdf_bytes = insights_to_pdf_bytes(
+                "Financial Insight Generator Report",
+                pdf_lines
+            )
 
-        st.download_button(
-            label="Download PDF report",
-            data=pdf_bytes,
-            file_name="financial_insights_report.pdf",
-            mime="application/pdf",
-        )
+            st.download_button(
+                label="Download PDF report",
+                data=pdf_bytes,
+                file_name="financial_insights_report.pdf",
+                mime="application/pdf",
+            )
+
+        except Exception as pdf_err:
+            st.error("PDF generation failed (analysis still completed).")
+            st.caption(f"PDF error: {pdf_err}")
 
 except Exception as e:
     st.error(f"Error processing file: {e}")

@@ -1,613 +1,436 @@
-import os
+import io
+from datetime import datetime
+
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-from sklearn.ensemble import IsolationForest
-from sklearn.cluster import KMeans
-from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import LinearRegression
-
 import plotly.express as px
-from fpdf import FPDF
+import plotly.graph_objects as go
 
-# Optional LLM narrative (only used if you configure a key)
-try:
-    from openai import OpenAI
-except Exception:
-    OpenAI = None
+from sklearn.ensemble import IsolationForest, RandomForestClassifier
+from sklearn.cluster import KMeans
 
 
 # -----------------------------
-# App config + onboarding
+# Page Setup
 # -----------------------------
 st.set_page_config(page_title="Financial Insight Generator", layout="wide")
 st.title("Financial Insight Generator")
-st.caption("Upload a transactions CSV (or use demo data) to generate insights, anomaly detection, clustering, forecasting, and a PDF report.")
+st.write("Upload a CSV of transactions to generate spending insights, anomalies, clustering, and an exportable report.")
 
-with st.expander("How to use this tool (Read me first)", expanded=True):
-    st.markdown(
-        """
-### What this app does
-- Cleans and validates your transaction data (so messy CSVs don’t crash the app)
-- Detects unusual transactions with **IsolationForest** (anomaly detection)
-- Groups transactions into spending tiers with **KMeans** (clustering)
-- Shows interactive **Plotly** charts (zoom, hover, filter)
-- Forecasts **future monthly spending** (simple baseline model)
-- Exports a **PDF report** (metrics + insights + forecast summary)
-
-### Required columns (case-insensitive)
-- `date` (parseable date)
-- `amount` (numeric; can include $, commas, parentheses)
-- `category` (text)
-- `merchant` (text)
-
-### Tips
-- If your CSV uses different names (e.g., `amt`), this app tries to auto-map common aliases.
-- If category/merchant are missing, the app can optionally fill them as “Uncategorized/Unknown”.
-        """
-    )
 
 # -----------------------------
-# Schema expectations + alias mapping
+# Helpers
 # -----------------------------
-REQUIRED_COLS = ["date", "amount", "category", "merchant"]
+def _standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Attempts to map common column variants to expected names.
+    Expected minimum: Amount
+    Optional: Date, Category, Merchant/Description
+    """
+    col_map = {}
 
-ALIASES = {
-    "date": ["date", "transaction_date", "posted_date", "trans_date", "datetime", "timestamp"],
-    "amount": ["amount", "amt", "value", "transaction_amount", "amount_usd", "amount($)"],
-    "category": ["category", "cat", "type", "merchant_category", "mcc_category"],
-    "merchant": ["merchant", "vendor", "payee", "description", "merchant_name", "name"],
-    "account": ["account", "acct", "account_name"],
-    # optional: if people upload "debit/credit" style
-    "debit": ["debit", "debits", "withdrawal"],
-    "credit": ["credit", "credits", "deposit"],
-}
+    # Normalize column names to make matching easier
+    normalized = {c: c.strip().lower() for c in df.columns}
 
-def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df.columns = [str(c).strip().lower() for c in df.columns]
-    return df
+    # Map Amount column
+    for c, cl in normalized.items():
+        if cl in ["amount", "amt", "transaction_amount", "value", "price"]:
+            col_map[c] = "Amount"
+            break
 
-def apply_aliases(df: pd.DataFrame) -> pd.DataFrame:
-    """Rename known aliases to canonical names if possible."""
-    df = df.copy()
-    cols = set(df.columns)
-    rename_map = {}
+    # Map Date column (optional)
+    for c, cl in normalized.items():
+        if cl in ["date", "transaction_date", "timestamp", "time"]:
+            col_map[c] = "Date"
+            break
 
-    for canonical, options in ALIASES.items():
-        if canonical in cols:
-            continue
-        for opt in options:
-            if opt in cols:
-                rename_map[opt] = canonical
+    # Map Category column (optional)
+    for c, cl in normalized.items():
+        if cl in ["category", "type", "expense_category"]:
+            col_map[c] = "Category"
+            break
+
+    # Map Merchant column (optional)
+    for c, cl in normalized.items():
+        if cl in ["merchant", "vendor", "payee"]:
+            col_map[c] = "Merchant"
+            break
+
+    # If you have "description" but not merchant, treat as merchant-like
+    if "Merchant" not in col_map.values():
+        for c, cl in normalized.items():
+            if cl in ["description", "details", "note", "narration"]:
+                col_map[c] = "Merchant"
                 break
 
-    if rename_map:
-        df = df.rename(columns=rename_map)
+    df = df.rename(columns=col_map)
+    return df
+
+
+def _parse_date_column(df: pd.DataFrame) -> pd.DataFrame:
+    """Parse Date if present and create time features."""
+    if "Date" in df.columns:
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+        # Basic time features
+        df["month"] = df["Date"].dt.month
+        df["day_of_week"] = df["Date"].dt.dayofweek
+        df["day"] = df["Date"].dt.day
+        df["is_weekend"] = df["day_of_week"].isin([5, 6]).astype(int)
+    else:
+        # If no date, create empty columns to keep pipeline stable
+        df["month"] = np.nan
+        df["day_of_week"] = np.nan
+        df["day"] = np.nan
+        df["is_weekend"] = np.nan
+    return df
+
+
+def _winsorize_amount(df: pd.DataFrame, cap_percentile: float) -> pd.DataFrame:
+    """
+    Caps Amount to an upper percentile to make charts more interpretable.
+    Keeps original Amount in Amount_raw.
+    """
+    df = df.copy()
+    df["Amount_raw"] = df["Amount"].astype(float)
+
+    cap_value = np.nanpercentile(df["Amount_raw"], cap_percentile)
+    df["Amount"] = np.minimum(df["Amount_raw"], cap_value)
 
     return df
 
-def parse_amount_series(s: pd.Series) -> pd.Series:
+
+def _build_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Handles values like: "$1,234.56", "(45.10)", "1,200", etc.
-    Returns numeric series with NaN for unparseable.
+    Build a feature matrix for ML.
+    Uses Amount + time features + category/merchant frequencies if available.
     """
-    s = s.astype(str).str.strip()
-
-    # Handle accounting negatives: (123.45) -> -123.45
-    s = s.str.replace("(", "-", regex=False).str.replace(")", "", regex=False)
-
-    # Remove currency symbols and commas
-    s = s.str.replace(r"[\$,]", "", regex=True)
-
-    return pd.to_numeric(s, errors="coerce")
-
-def validate_and_clean(df: pd.DataFrame, allow_fill_missing_text: bool = True) -> tuple[pd.DataFrame, dict]:
-    """
-    Returns cleaned df + a data quality report dict.
-    """
-    report = {
-        "raw_rows": len(df),
-        "raw_cols": list(df.columns),
-        "dropped_rows": 0,
-        "invalid_date_rows": 0,
-        "invalid_amount_rows": 0,
-        "missing_category_rows": 0,
-        "missing_merchant_rows": 0,
-        "final_rows": 0,
-        "notes": [],
-    }
-
-    df = normalize_columns(df)
-    df = apply_aliases(df)
-
-    # If "amount" doesn't exist but debit/credit do, derive amount = debit - credit
-    if "amount" not in df.columns and {"debit", "credit"}.issubset(df.columns):
-        report["notes"].append("Derived amount from debit/credit: amount = debit - credit.")
-        debit = parse_amount_series(df["debit"]).fillna(0)
-        credit = parse_amount_series(df["credit"]).fillna(0)
-        df["amount"] = debit - credit
-
-    # Optionally fill missing text columns
-    if allow_fill_missing_text:
-        if "category" not in df.columns:
-            df["category"] = "Uncategorized"
-            report["notes"].append("Missing category column; filled with 'Uncategorized'.")
-        if "merchant" not in df.columns:
-            df["merchant"] = "Unknown"
-            report["notes"].append("Missing merchant column; filled with 'Unknown'.")
-
-    # Validate required cols
-    missing = [c for c in REQUIRED_COLS if c not in df.columns]
-    if missing:
-        report["notes"].append(f"Missing required columns: {missing}")
-        # return empty to force a friendly message upstream
-        return pd.DataFrame(), report
-
-    # Parse types (track invalids before dropping)
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df["amount"] = parse_amount_series(df["amount"])
-
-    report["invalid_date_rows"] = int(df["date"].isna().sum())
-    report["invalid_amount_rows"] = int(df["amount"].isna().sum())
-    report["missing_category_rows"] = int(df["category"].isna().sum())
-    report["missing_merchant_rows"] = int(df["merchant"].isna().sum())
-
-    # Drop bad rows
-    before = len(df)
-    df = df.dropna(subset=["date", "amount", "category", "merchant"])
-    after = len(df)
-
-    report["dropped_rows"] = int(before - after)
-    report["final_rows"] = int(after)
-
-    return df, report
-
-
-# -----------------------------
-# ML: anomalies + clusters
-# -----------------------------
-def analyze_transactions(df: pd.DataFrame, contamination: float, n_clusters: int) -> pd.DataFrame:
     df = df.copy()
 
-    X = df[["amount"]].values
-
-    iso = IsolationForest(contamination=contamination, random_state=42)
-    df["anomaly_flag"] = (iso.fit_predict(X) == -1).astype(int)  # 1 = anomaly
-
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-
-    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init="auto")
-    df["cluster"] = kmeans.fit_predict(X_scaled)
-
-    return df
-
-def cap_amounts(series: pd.Series, cap_quantile: float) -> pd.Series:
-    cap_value = series.quantile(cap_quantile)
-    return np.minimum(series, cap_value)
-
-
-# -----------------------------
-# Forecast: monthly spend baseline (trend + seasonality)
-# -----------------------------
-def forecast_monthly_spend(df: pd.DataFrame, horizon_months: int = 6) -> pd.DataFrame:
-    """
-    Forecast monthly spend using LinearRegression on:
-      - time index (trend)
-      - month-of-year one-hot (seasonality)
-    Excludes refunds (amount <= 0) from spend forecast.
-    """
-    d = df.copy()
-    d = d[d["amount"] > 0].copy()
-    d["month"] = d["date"].dt.to_period("M").dt.to_timestamp()
-    monthly = d.groupby("month")["amount"].sum().reset_index().sort_values("month")
-
-    if len(monthly) < 4:
-        # not enough history -> flat forecast
-        last = float(monthly["amount"].iloc[-1]) if len(monthly) else 0.0
-        future_months = pd.date_range(
-            start=(monthly["month"].max() + pd.offsets.MonthBegin(1)) if len(monthly) else pd.Timestamp.today().replace(day=1),
-            periods=horizon_months,
-            freq="MS",
-        )
-        return pd.DataFrame({
-            "month": list(monthly["month"]) + list(future_months),
-            "actual": list(monthly["amount"]) + [np.nan] * horizon_months,
-            "forecast": [np.nan] * len(monthly) + [last] * horizon_months,
-        })
-
-    monthly["t"] = np.arange(len(monthly))
-    monthly["moy"] = monthly["month"].dt.month
-
-    X = pd.get_dummies(monthly[["t", "moy"]], columns=["moy"], drop_first=True)
-    y = monthly["amount"].values
-
-    model = LinearRegression()
-    model.fit(X, y)
-
-    last_month = monthly["month"].max()
-    future_months = pd.date_range(start=last_month + pd.offsets.MonthBegin(1), periods=horizon_months, freq="MS")
-    future = pd.DataFrame({"month": future_months})
-    future["t"] = np.arange(len(monthly), len(monthly) + horizon_months)
-    future["moy"] = future["month"].dt.month
-
-    Xf = pd.get_dummies(future[["t", "moy"]], columns=["moy"], drop_first=True)
-    Xf = Xf.reindex(columns=X.columns, fill_value=0)
-
-    yhat = model.predict(Xf)
-    yhat = np.maximum(yhat, 0)
-
-    return pd.DataFrame({
-        "month": list(monthly["month"]) + list(future_months),
-        "actual": list(monthly["amount"]) + [np.nan] * horizon_months,
-        "forecast": [np.nan] * len(monthly) + list(yhat),
-    })
-
-
-# -----------------------------
-# Narrative: rule-based insights + optional LLM
-# -----------------------------
-def rule_based_insights(df: pd.DataFrame) -> list[str]:
-    total_spend = float(df["amount"].sum())
-    avg_txn = float(df["amount"].mean())
-    anomaly_rate = float(df["anomaly_flag"].mean() * 100)
-
-    top_category = df.groupby("category")["amount"].sum().sort_values(ascending=False).head(1).index[0]
-    top_merchant = df.groupby("merchant")["amount"].sum().sort_values(ascending=False).head(1).index[0]
-
-    high_spend = df[df["amount"] > df["amount"].mean() + 2 * df["amount"].std()]
-    n_high = len(high_spend)
-
-    bullets = [
-        f"Total spend is **${total_spend:,.2f}** across **{len(df):,}** transactions (avg **${avg_txn:,.2f}**).",
-        f"Top category is **{top_category}**; top merchant by total spend is **{top_merchant}**.",
-        f"Anomaly detection flagged **{anomaly_rate:.2f}%** of transactions as unusual.",
-    ]
-
-    if n_high > 0:
-        bullets.append(f"Detected **{n_high:,}** high-value transactions (> mean + 2×std). Consider adding review/alerts.")
-
-    if anomaly_rate >= 6:
-        bullets.append("Recommendation: add a stricter review rule for top 1–2% largest transactions or anomalies.")
+    # Frequency encodings help anomaly detection beyond raw amount
+    if "Category" in df.columns:
+        df["category_freq"] = df["Category"].astype(str).map(df["Category"].astype(str).value_counts())
     else:
-        bullets.append("Recommendation: do a weekly review of the top 20 transactions + anomalies flagged.")
+        df["category_freq"] = 0
 
-    bullets.append("Recommendation: look for recurring costs in top merchants/categories and consider consolidating or renegotiating.")
-    return bullets
+    if "Merchant" in df.columns:
+        df["merchant_freq"] = df["Merchant"].astype(str).map(df["Merchant"].astype(str).value_counts())
+    else:
+        df["merchant_freq"] = 0
 
-def generate_llm_summary(stats: dict) -> str:
-    if OpenAI is None:
-        return "LLM library not installed. Add `openai` to requirements.txt to enable."
-    api_key = st.secrets.get("OPENAI_API_KEY", None)
-    if not api_key:
-        return "No LLM configured. Add OPENAI_API_KEY to Streamlit secrets to enable narrative insights."
+    # Fill NaNs
+    for c in ["month", "day_of_week", "day", "is_weekend"]:
+        df[c] = df[c].fillna(-1)
 
-    client = OpenAI(api_key=api_key)
-    prompt = f"""
-You are a personal finance analytics assistant. Write a concise, practical insight summary.
-Use these computed metrics (do not invent numbers):
-{stats}
+    feature_cols = ["Amount", "month", "day_of_week", "day", "is_weekend", "category_freq", "merchant_freq"]
+    X = df[feature_cols].astype(float)
 
-Include:
-- 2–3 key observations
-- 2 action-oriented recommendations
-- mention any notable anomaly behavior
-Keep it under 120 words.
-"""
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.3,
-    )
-    return resp.choices[0].message.content.strip()
+    return X
 
 
-# -----------------------------
-# PDF export
-# -----------------------------
-def insights_to_pdf_bytes(title: str, lines: list[str]) -> bytes:
+def analyze_transactions(df: pd.DataFrame, contamination: float, k: int) -> tuple[list[str], pd.DataFrame, pd.DataFrame]:
+    """
+    Runs IsolationForest for anomalies, KMeans for clusters,
+    and RandomForestClassifier to predict anomaly label (explainability via feature importances).
+    Returns:
+      - insights list (strings)
+      - enriched dataframe
+      - feature importance dataframe
+    """
+    df = df.copy()
+
+    # Feature matrix
+    X = _build_feature_matrix(df)
+
+    # Anomaly detection
+    iso = IsolationForest(contamination=contamination, random_state=42)
+    iso_pred = iso.fit_predict(X)  # -1 anomaly, 1 normal
+    df["anomaly_label"] = np.where(iso_pred == -1, "Anomaly", "Normal")
+
+    # Clustering (use Amount + simple time features for better separation)
+    # Note: KMeans needs finite values; X is numeric and filled.
+    kmeans = KMeans(n_clusters=k, random_state=42, n_init="auto")
+    df["cluster"] = kmeans.fit_predict(X[["Amount", "month", "day_of_week", "category_freq", "merchant_freq"]])
+
+    # Build insights
+    insights = []
+
+    total_spent = df["Amount_raw"].sum() if "Amount_raw" in df.columns else df["Amount"].sum()
+    avg_spent = df["Amount_raw"].mean() if "Amount_raw" in df.columns else df["Amount"].mean()
+    anomaly_count = (df["anomaly_label"] == "Anomaly").sum()
+
+    insights.append(f"Total Spending: ${total_spent:,.2f}")
+    insights.append(f"Average Transaction: ${avg_spent:,.2f}")
+    insights.append(f"Anomalies Detected: {anomaly_count} transactions flagged as unusual (IsolationForest).")
+
+    # High spenders (use raw for accuracy)
+    raw = df["Amount_raw"] if "Amount_raw" in df.columns else df["Amount"]
+    threshold = raw.mean() + 2 * raw.std()
+    high_spend = df[raw > threshold]
+    if len(high_spend) > 0:
+        insights.append(f"High-Value Outliers: {len(high_spend)} transactions exceed mean + 2*std.")
+
+    # RandomForest explanation model
+    # Train a simple classifier to approximate anomaly_label; feature importances give “why”
+    y = (df["anomaly_label"] == "Anomaly").astype(int)
+    rf = RandomForestClassifier(n_estimators=200, random_state=42, class_weight="balanced")
+    rf.fit(X, y)
+
+    importance = pd.DataFrame({
+        "feature": X.columns,
+        "importance": rf.feature_importances_
+    }).sort_values("importance", ascending=False)
+
+    return insights, df, importance
+
+
+def build_pdf_report(
+    title: str,
+    metrics: dict,
+    insights: list[str],
+    notes: str = ""
+) -> bytes:
+    """
+    Generates a simple PDF report (text-based) for download.
+    Uses fpdf2 (lightweight).
+    """
+    from fpdf import FPDF  # imported here so Streamlit runs without PDF dependency until needed
+
     pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
-    pdf.set_auto_page_break(auto=True, margin=12)
 
-    # Helvetica is safer than Arial in many environments
-    pdf.set_font("Helvetica", style="B", size=14)
-    pdf.multi_cell(0, 8, title)
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.multi_cell(0, 10, title)
     pdf.ln(2)
 
-    pdf.set_font("Helvetica", size=11)
-    for line in lines:
-        pdf.multi_cell(0, 6, f"- {line}")
+    pdf.set_font("Helvetica", "", 11)
+    pdf.multi_cell(0, 7, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    pdf.ln(2)
+
+    pdf.set_font("Helvetica", "B", 12)
+    pdf.multi_cell(0, 8, "Summary Metrics")
+    pdf.set_font("Helvetica", "", 11)
+    for k, v in metrics.items():
+        pdf.multi_cell(0, 7, f"- {k}: {v}")
+    pdf.ln(2)
+
+    pdf.set_font("Helvetica", "B", 12)
+    pdf.multi_cell(0, 8, "Key Insights")
+    pdf.set_font("Helvetica", "", 11)
+    for item in insights:
+        pdf.multi_cell(0, 7, f"- {item}")
+    pdf.ln(2)
+
+    if notes.strip():
+        pdf.set_font("Helvetica", "B", 12)
+        pdf.multi_cell(0, 8, "Notes")
+        pdf.set_font("Helvetica", "", 11)
+        pdf.multi_cell(0, 7, notes)
 
     return pdf.output(dest="S").encode("latin-1")
 
 
 # -----------------------------
-# UI controls
+# Sidebar Controls
 # -----------------------------
-st.sidebar.header("Data source")
-use_demo = st.sidebar.checkbox("Use demo dataset included in repo", value=True)
+st.sidebar.header("Controls")
 
-st.sidebar.header("Model settings")
-contamination = st.sidebar.slider("Anomaly sensitivity (IsolationForest contamination)", 0.01, 0.15, 0.05, 0.01)
-n_clusters = st.sidebar.slider("Number of clusters (KMeans)", 2, 8, 3, 1)
+cap_percentile = st.sidebar.slider(
+    "Cap extreme values at percentile (for charts)",
+    min_value=90,
+    max_value=100,
+    value=99,
+    step=1,
+    help="Caps large values to reduce skew and improve chart readability."
+)
 
-st.sidebar.header("Chart settings")
-cap_toggle = st.sidebar.checkbox("Cap extreme values for charts", value=True)
-cap_q = st.sidebar.slider("Cap quantile (higher = less capping)", 0.90, 0.999, 0.98, 0.001)
+contamination = st.sidebar.slider(
+    "IsolationForest contamination",
+    min_value=0.01,
+    max_value=0.20,
+    value=0.05,
+    step=0.01,
+    help="Expected fraction of anomalies in data."
+)
 
-chart_set = st.sidebar.multiselect(
-    "Charts to show",
+k_clusters = st.sidebar.slider(
+    "KMeans clusters",
+    min_value=2,
+    max_value=8,
+    value=3,
+    step=1
+)
+
+chart_choices = st.sidebar.multiselect(
+    "Charts to display",
     [
-        "Daily Spending Trend",
-        "Monthly Spend Trend",
-        "Category Spend",
-        "Category Share (Donut)",
-        "Monthly Heatmap",
-        "Anomaly Rate (Weekly)",
+        "Amount Histogram",
+        "Amount Boxplot",
+        "Clusters (Scatter)",
+        "Spending Over Time",
+        "Top Categories",
         "Top Merchants",
-        "Recurring Merchants",
-        "Anomaly Transactions Table",
-        "Box Plot",
-        "Cluster Scatter",
-        "Future Spend Forecast (Monthly)",
+        "Anomalies Table",
+        "Explainability (Feature Importance)"
     ],
-    default=["Monthly Spend Trend", "Category Spend", "Anomaly Rate (Weekly)", "Future Spend Forecast (Monthly)"]
+    default=["Amount Histogram", "Amount Boxplot", "Clusters (Scatter)", "Top Categories", "Explainability (Feature Importance)"]
 )
 
-top_n_merchants = st.sidebar.slider("Top merchants", 5, 30, 10, 1)
-
-st.sidebar.header("Forecast")
-forecast_months = st.sidebar.slider("Forecast horizon (months)", 3, 12, 6, 1)
-
-st.sidebar.header("Narrative")
-show_llm = st.sidebar.checkbox("Generate optional LLM narrative (requires API key)", value=False)
-show_raw = st.sidebar.checkbox("Show processed dataset preview", value=False)
-
-st.sidebar.header("Validation")
-allow_fill_missing_text = st.sidebar.checkbox("Fill missing category/merchant if absent", value=True)
+st.sidebar.markdown("---")
+want_pdf = st.sidebar.checkbox("Enable PDF export", value=True)
+notes_for_pdf = st.sidebar.text_area("Optional notes for PDF", "")
 
 
 # -----------------------------
-# Load data
+# Upload + Run
 # -----------------------------
-df_raw = None
-demo_path = os.path.join("data", "fake_transactions_10k.csv")
+uploaded_file = st.file_uploader("Upload Transaction CSV", type=["csv"])
 
-if use_demo:
-    if not os.path.exists(demo_path):
-        st.error(f"Demo dataset not found at `{demo_path}`. Add your CSV there or turn off demo mode.")
-        st.stop()
-    df_raw = pd.read_csv(demo_path)
-    st.success("Loaded demo dataset: data/fake_transactions_10k.csv")
-else:
-    uploaded_file = st.file_uploader("Upload Transaction CSV", type=["csv"])
-    if uploaded_file is None:
-        st.info("Upload a CSV to begin, or enable the demo dataset from the sidebar.")
-        st.stop()
-    df_raw = pd.read_csv(uploaded_file)
+if uploaded_file:
+    try:
+        df = pd.read_csv(uploaded_file)
+        df = _standardize_columns(df)
 
+        # Validate minimum columns
+        if "Amount" not in df.columns:
+            st.error("Your CSV must include an Amount column (or similar like 'amount', 'amt', 'value').")
+            st.stop()
 
-# -----------------------------
-# Validate + clean
-# -----------------------------
-df_clean, report = validate_and_clean(df_raw, allow_fill_missing_text=allow_fill_missing_text)
+        # Parse date + create features
+        df = _parse_date_column(df)
 
-st.subheader("Data Quality Check")
-st.write("Detected columns:", report["raw_cols"])
+        # Cap outliers for charts (keep raw in Amount_raw)
+        df = _winsorize_amount(df, cap_percentile=cap_percentile)
 
-c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("Rows (raw)", report["raw_rows"])
-c2.metric("Invalid dates", report["invalid_date_rows"])
-c3.metric("Invalid amounts", report["invalid_amount_rows"])
-c4.metric("Dropped rows", report["dropped_rows"])
-c5.metric("Rows (clean)", report["final_rows"])
+        st.subheader("Data Preview")
+        st.dataframe(df.head(10), use_container_width=True)
 
-if report["notes"]:
-    st.info("Notes:\n- " + "\n- ".join(report["notes"]))
-
-if df_clean.empty:
-    st.error(
-        "Could not proceed because required columns were missing or too many rows were invalid.\n\n"
-        "Required columns are: date, amount, category, merchant (case-insensitive)."
-    )
-    st.stop()
-
-if len(df_clean) < 50:
-    st.warning("Very small dataset after cleaning. Charts/models may be unstable. Try a dataset with more rows.")
-
-
-# -----------------------------
-# Run analysis
-# -----------------------------
-df_out = analyze_transactions(df_clean, contamination=contamination, n_clusters=n_clusters)
-
-# Capped copy for charts only
-df_plot = df_out.copy()
-df_plot["amount_plot"] = cap_amounts(df_plot["amount"], cap_q) if cap_toggle else df_plot["amount"]
-
-# Summary metrics
-total_spend = float(df_out["amount"].sum())
-avg_txn = float(df_out["amount"].mean())
-anomaly_rate = float(df_out["anomaly_flag"].mean() * 100)
-top_category = df_out.groupby("category")["amount"].sum().sort_values(ascending=False).head(1).index[0]
-
-st.subheader("Summary")
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("Transactions", f"{len(df_out):,}")
-m2.metric("Total spend", f"${total_spend:,.2f}")
-m3.metric("Avg transaction", f"${avg_txn:,.2f}")
-m4.metric("Anomaly rate", f"{anomaly_rate:.2f}%")
-
-
-# -----------------------------
-# Insights
-# -----------------------------
-st.subheader("Key Insights")
-bullets = rule_based_insights(df_out)
-for b in bullets:
-    st.markdown(f"- {b}")
-
-if show_llm:
-    st.subheader("Narrative Summary (Optional LLM)")
-    stats_for_llm = {
-        "transactions": len(df_out),
-        "total_spend": round(total_spend, 2),
-        "avg_transaction": round(avg_txn, 2),
-        "anomaly_rate_pct": round(anomaly_rate, 2),
-        "top_category": top_category,
-    }
-    st.write(generate_llm_summary(stats_for_llm))
-
-
-# -----------------------------
-# Charts
-# -----------------------------
-st.subheader("Interactive Charts")
-
-if not chart_set:
-    st.info("No charts selected. Use the sidebar to add charts.")
-else:
-    tabs = st.tabs(chart_set)
-    for tab_name, tab in zip(chart_set, tabs):
-        with tab:
-            if tab_name == "Daily Spending Trend":
-                daily = df_plot.groupby(pd.Grouper(key="date", freq="D"))["amount_plot"].sum().reset_index()
-                fig = px.line(daily, x="date", y="amount_plot", title="Daily Spending Trend")
-                st.plotly_chart(fig, use_container_width=True)
-
-            elif tab_name == "Monthly Spend Trend":
-                monthly = df_plot.copy()
-                monthly["month"] = monthly["date"].dt.to_period("M").dt.to_timestamp()
-                monthly = monthly.groupby("month")["amount_plot"].sum().reset_index()
-                fig = px.line(monthly, x="month", y="amount_plot", title="Monthly Spend Trend")
-                st.plotly_chart(fig, use_container_width=True)
-
-            elif tab_name == "Category Spend":
-                cat_spend = df_plot.groupby("category")["amount_plot"].sum().sort_values(ascending=False).reset_index()
-                fig = px.bar(cat_spend, x="category", y="amount_plot", title="Total Spend by Category")
-                st.plotly_chart(fig, use_container_width=True)
-
-            elif tab_name == "Category Share (Donut)":
-                cat = df_plot.groupby("category")["amount_plot"].sum().sort_values(ascending=False).reset_index()
-                fig = px.pie(cat, names="category", values="amount_plot", hole=0.45, title="Category Share of Spend")
-                st.plotly_chart(fig, use_container_width=True)
-
-            elif tab_name == "Monthly Heatmap":
-                tmp = df_plot.copy()
-                tmp["month"] = tmp["date"].dt.to_period("M").astype(str)
-                heat = tmp.pivot_table(index="category", columns="month", values="amount_plot", aggfunc="sum", fill_value=0)
-                heat_reset = heat.reset_index().melt(id_vars="category", var_name="month", value_name="spend")
-                fig = px.density_heatmap(
-                    heat_reset, x="month", y="category", z="spend",
-                    title="Monthly Spending Heatmap (Category vs Month)",
+        # Run analysis button
+        if st.button("Generate Insights", type="primary"):
+            with st.spinner("Running ML analysis (anomalies + clustering + explanation)..."):
+                insights, df_out, importance = analyze_transactions(
+                    df=df,
+                    contamination=contamination,
+                    k=k_clusters
                 )
+
+            # Summary Metrics
+            st.subheader("Summary Metrics")
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("Total Transactions", f"{df_out.shape[0]}")
+            col2.metric("Total Spending", f"${df_out['Amount_raw'].sum():,.2f}")
+            col3.metric("Average Amount", f"${df_out['Amount_raw'].mean():,.2f}")
+            col4.metric("Anomalies", f"{(df_out['anomaly_label']=='Anomaly').sum()}")
+
+            st.subheader("Key Insights")
+            for item in insights:
+                st.write(f"- {item}")
+
+            # -----------------------------
+            # Plotly Charts (Interactive)
+            # -----------------------------
+            if "Amount Histogram" in chart_choices:
+                st.subheader("Amount Distribution (Capped for readability)")
+                fig = px.histogram(df_out, x="Amount", nbins=40, title="Histogram of Transaction Amounts (Capped)")
                 st.plotly_chart(fig, use_container_width=True)
 
-            elif tab_name == "Anomaly Rate (Weekly)":
-                weekly = df_out.groupby(pd.Grouper(key="date", freq="W"))["anomaly_flag"].mean().reset_index()
-                fig = px.line(weekly, x="date", y="anomaly_flag", title="Anomaly Rate Over Time (Weekly)")
-                fig.update_yaxes(tickformat=".0%")
+            if "Amount Boxplot" in chart_choices:
+                st.subheader("Amount Spread (Boxplot - Capped)")
+                fig = px.box(df_out, x="Amount", points="outliers", title="Boxplot of Transaction Amounts (Capped)")
+                fig.update_layout(height=350)
                 st.plotly_chart(fig, use_container_width=True)
 
-            elif tab_name == "Top Merchants":
-                merch = (
-                    df_plot.groupby("merchant")["amount_plot"].sum()
-                    .sort_values(ascending=False).head(top_n_merchants).reset_index()
-                )
-                fig = px.bar(merch, x="merchant", y="amount_plot", title=f"Top {top_n_merchants} Merchants by Spend")
-                fig.update_layout(xaxis_tickangle=-30)
-                st.plotly_chart(fig, use_container_width=True)
-
-            elif tab_name == "Recurring Merchants":
-                tmp = df_out[df_out["amount"] > 0].copy()
-                tmp["month"] = tmp["date"].dt.to_period("M").astype(str)
-                merchant_months = tmp.groupby("merchant")["month"].nunique().sort_values(ascending=False)
-                recurring = merchant_months[merchant_months >= 3].head(25)
-
-                if recurring.empty:
-                    st.info("No recurring merchants detected using heuristic: appearing in ≥ 3 different months.")
-                else:
-                    rec_df = recurring.reset_index()
-                    rec_df.columns = ["merchant", "months_active"]
-                    fig = px.bar(rec_df, x="merchant", y="months_active", title="Recurring Merchants (≥ 3 months active)")
-                    fig.update_layout(xaxis_tickangle=-30)
-                    st.plotly_chart(fig, use_container_width=True)
-                    st.caption("Heuristic: merchants appearing in 3+ distinct months may be subscriptions/recurring bills.")
-
-            elif tab_name == "Anomaly Transactions Table":
-                anomalies = df_out[df_out["anomaly_flag"] == 1].copy().sort_values("amount", ascending=False).head(50)
-                if anomalies.empty:
-                    st.info("No anomalies flagged at the current sensitivity.")
-                else:
-                    st.dataframe(anomalies[["date", "merchant", "category", "amount", "cluster"]], use_container_width=True)
-
-            elif tab_name == "Box Plot":
-                fig = px.box(df_plot, y="amount_plot", points="outliers", title="Transaction Value Spread (Box Plot)")
-                st.plotly_chart(fig, use_container_width=True)
-
-            elif tab_name == "Cluster Scatter":
-                tmp = df_plot.reset_index(drop=True)
+            if "Clusters (Scatter)" in chart_choices:
+                st.subheader("KMeans Clustering View")
                 fig = px.scatter(
-                    tmp,
-                    x=tmp.index,
-                    y="amount_plot",
+                    df_out.reset_index(),
+                    x="index",
+                    y="Amount",
                     color="cluster",
-                    title="KMeans Clustering (Index vs Amount)",
-                    opacity=0.7,
+                    symbol="anomaly_label",
+                    title="Clusters (color) with Anomalies (symbol) — Amount vs Index",
+                    hover_data=[c for c in ["Date", "Category", "Merchant", "Amount_raw"] if c in df_out.columns]
                 )
+                fig.update_layout(height=450)
                 st.plotly_chart(fig, use_container_width=True)
 
-            elif tab_name == "Future Spend Forecast (Monthly)":
-                fc = forecast_monthly_spend(df_out, horizon_months=forecast_months)
-                fc["series"] = fc["actual"].combine_first(fc["forecast"])
-                fig = px.line(fc, x="month", y="series", title="Monthly Spend: Actual + Forecast")
+            if "Spending Over Time" in chart_choices and "Date" in df_out.columns:
+                st.subheader("Spending Over Time")
+                df_ts = df_out.dropna(subset=["Date"]).copy()
+                df_ts = df_ts.sort_values("Date")
+                df_daily = df_ts.groupby(df_ts["Date"].dt.date)["Amount_raw"].sum().reset_index()
+                df_daily.columns = ["Date", "DailySpend"]
+                fig = px.line(df_daily, x="Date", y="DailySpend", title="Daily Spend (Raw Amount)")
+                fig.update_layout(height=420)
                 st.plotly_chart(fig, use_container_width=True)
 
-                future_only = fc[fc["forecast"].notna()][["month", "forecast"]].copy()
-                future_only["month"] = future_only["month"].dt.strftime("%Y-%m")
-                future_only["forecast"] = future_only["forecast"].round(2)
-                st.dataframe(future_only, use_container_width=True)
+            if "Top Categories" in chart_choices and "Category" in df_out.columns:
+                st.subheader("Top Categories by Spend")
+                cat = df_out.groupby("Category")["Amount_raw"].sum().sort_values(ascending=False).head(10).reset_index()
+                fig = px.bar(cat, x="Category", y="Amount_raw", title="Top 10 Categories by Total Spend")
+                fig.update_layout(height=420)
+                st.plotly_chart(fig, use_container_width=True)
 
+            if "Top Merchants" in chart_choices and "Merchant" in df_out.columns:
+                st.subheader("Top Merchants by Spend")
+                mer = df_out.groupby("Merchant")["Amount_raw"].sum().sort_values(ascending=False).head(10).reset_index()
+                fig = px.bar(mer, x="Merchant", y="Amount_raw", title="Top 10 Merchants by Total Spend")
+                fig.update_layout(height=420)
+                st.plotly_chart(fig, use_container_width=True)
 
-# -----------------------------
-# Download PDF report
-# -----------------------------
-st.subheader("Download Report")
+            if "Anomalies Table" in chart_choices:
+                st.subheader("Flagged Anomalies")
+                anomalies = df_out[df_out["anomaly_label"] == "Anomaly"].copy()
+                show_cols = [c for c in ["Date", "Category", "Merchant", "Amount_raw", "Amount", "cluster"] if c in anomalies.columns]
+                st.dataframe(anomalies[show_cols].sort_values("Amount_raw", ascending=False).head(50), use_container_width=True)
 
-# Forecast summary for PDF
-forecast_lines = []
-fc = forecast_monthly_spend(df_out, horizon_months=forecast_months)
-future_only = fc[fc["forecast"].notna()].copy()
-if not future_only.empty:
-    next_month_forecast = float(future_only.iloc[0]["forecast"])
-    horizon_total = float(future_only["forecast"].sum())
-    forecast_lines = [
-        f"Forecast horizon: {forecast_months} months",
-        f"Next month forecast (spend): ${next_month_forecast:,.2f}",
-        f"Forecast total over horizon: ${horizon_total:,.2f}",
-        "Forecast note: baseline model using historical monthly trend + seasonality; accuracy may vary.",
-    ]
+            if "Explainability (Feature Importance)" in chart_choices:
+                st.subheader("What drove the anomaly decisions? (Explainability)")
+                st.write(
+                    "This uses a RandomForestClassifier trained to approximate the anomaly label. "
+                    "Feature importances indicate which variables most influenced anomaly vs normal classification."
+                )
+                fig = px.bar(
+                    importance.head(10),
+                    x="importance",
+                    y="feature",
+                    orientation="h",
+                    title="Top Feature Importances (Proxy Explainability)",
+                )
+                fig.update_layout(height=420, yaxis={"categoryorder": "total ascending"})
+                st.plotly_chart(fig, use_container_width=True)
 
-pdf_lines = [
-    f"Transactions (clean): {len(df_out):,}",
-    f"Total spend: ${total_spend:,.2f}",
-    f"Avg transaction: ${avg_txn:,.2f}",
-    f"Anomaly rate: {anomaly_rate:.2f}%",
-    f"Top category: {top_category}",
-] + forecast_lines + bullets
+            # -----------------------------
+            # PDF Export
+            # -----------------------------
+            if want_pdf:
+                metrics = {
+                    "Total Transactions": f"{df_out.shape[0]}",
+                    "Total Spending": f"${df_out['Amount_raw'].sum():,.2f}",
+                    "Average Transaction": f"${df_out['Amount_raw'].mean():,.2f}",
+                    "Anomalies": f"{(df_out['anomaly_label']=='Anomaly').sum()}",
+                    "Cap Percentile": f"{cap_percentile}th",
+                    "IsolationForest contamination": f"{contamination}",
+                    "KMeans clusters": f"{k_clusters}"
+                }
 
-pdf_bytes = insights_to_pdf_bytes("Financial Insight Generator Report", pdf_lines)
+                pdf_bytes = build_pdf_report(
+                    title="Financial Insight Generator Report",
+                    metrics=metrics,
+                    insights=insights,
+                    notes=notes_for_pdf
+                )
 
-st.download_button(
-    label="Download PDF report",
-    data=pdf_bytes,
-    file_name="financial_insights_report.pdf",
-    mime="application/pdf",
-)
+                st.download_button(
+                    label="Download Insights as PDF",
+                    data=pdf_bytes,
+                    file_name="financial_insights_report.pdf",
+                    mime="application/pdf"
+                )
 
-if show_raw:
-    with st.expander("Processed Data (Preview)"):
-        st.dataframe(df_out.head(200), use_container_width=True)
+    except Exception as e:
+        st.error(f"Error processing file: {e}")
+else:
+    st.info("Upload a CSV to begin. Minimum requirement: a column named Amount (or similar).")

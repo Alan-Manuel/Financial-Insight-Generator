@@ -118,30 +118,40 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # -----------------------------
-# PDF safety (fixes your error)
+# PDF safety (STRONG FIX - prevents "Not enough horizontal space..." forever)
 # -----------------------------
-def _break_long_words(text: str, max_len: int = 40) -> str:
-    out = []
-    for token in str(text).split(" "):
-        if len(token) > max_len:
-            token = " ".join(token[i:i+max_len] for i in range(0, len(token), max_len))
-        out.append(token)
-    return " ".join(out)
+def _wrap_hard(text: str, width: int = 60) -> str:
+    """
+    Hard-wrap every `width` chars so FPDF never sees an unbreakable long token.
+    Works even for URLs, hashes, long merchant strings, etc.
+    """
+    text = str(text)
+    return "\n".join(text[i:i + width] for i in range(0, len(text), width))
+
 
 def _pdf_safe(text: str) -> str:
-    text = _break_long_words(text, max_len=40)
-    return text.encode("latin-1", "replace").decode("latin-1")
+    """
+    Make text safe for FPDF:
+    - hard wrap long strings
+    - replace unsupported unicode
+    """
+    wrapped = _wrap_hard(text, width=60)
+    return wrapped.encode("latin-1", "replace").decode("latin-1")
+
 
 def insights_to_pdf_bytes(title: str, lines: list[str]) -> bytes:
     pdf = FPDF()
     pdf.add_page()
     pdf.set_auto_page_break(auto=True, margin=12)
+
     pdf.set_font("Helvetica", style="B", size=14)
     pdf.multi_cell(0, 8, _pdf_safe(title))
     pdf.ln(2)
+
     pdf.set_font("Helvetica", size=11)
     for line in lines:
         pdf.multi_cell(0, 6, _pdf_safe(f"- {line}"))
+
     return pdf.output(dest="S").encode("latin-1")
 
 
@@ -191,7 +201,6 @@ def analyze_transactions(df: pd.DataFrame, contamination: float, n_clusters: int
         insights.append(f"High-value outliers (> mean + 2×std): {len(high_spend):,}")
 
     # Explainability proxy: RF trained to mimic anomaly_flag + permutation importance
-    # (Enticing “AI” without SHAP dependency)
     y = df["anomaly_flag"].astype(int)
     rf = RandomForestClassifier(n_estimators=250, random_state=42, class_weight="balanced")
     rf.fit(X, y)

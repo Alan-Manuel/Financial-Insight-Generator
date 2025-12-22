@@ -1,4 +1,7 @@
-pandas
-scikit-learn
 streamlit
-matplotlib
+pandas
+numpy
+scikit-learn
+plotly
+fpdf2
+openai

@@ -105,4 +105,152 @@ def analyze_transactions(df: pd.DataFrame, contamination: float, n_clusters: int
 
     insights = []
     insights.append(f"Total Spending: ${total_spent:,.2f}")
-    ins
+    insights.append(f"Average Transaction: ${avg_spent:,.2f}")
+    insights.append(f"Anomalies Flagged: {anomaly_count:,} ({anomaly_rate:.2f}%)")
+    if not high_spend.empty:
+        insights.append(f"{len(high_spend):,} unusually high-value transactions (> mean + 2×std).")
+    insights.append("Tip: Review anomalies + top transactions weekly to catch unusual spending early.")
+
+    return insights, df
+
+
+# -----------------------------
+# Upload UI
+# -----------------------------
+uploaded_file = st.file_uploader("Upload Transaction CSV", type=["csv"])
+
+if not uploaded_file:
+    st.info("Upload a CSV to begin.")
+    st.stop()
+
+try:
+    df = pd.read_csv(uploaded_file)
+
+    if "Amount" not in df.columns:
+        st.error("The uploaded file must contain an 'Amount' column.")
+        st.stop()
+
+    # Clean Amount
+    df["Amount"] = parse_amount(df["Amount"])
+    df = df.dropna(subset=["Amount"]).copy()
+
+    if df.empty:
+        st.error("No valid numeric Amount values found after parsing.")
+        st.stop()
+
+    # Controls to make charts “look better”
+    st.sidebar.header("Chart Controls")
+    cap_toggle = st.sidebar.checkbox("Cap extreme values (recommended)", value=True)
+    cap_q = st.sidebar.slider("Cap quantile", 0.90, 0.999, 0.98, 0.001)
+    contamination = st.sidebar.slider("Anomaly sensitivity", 0.01, 0.20, 0.05, 0.01)
+    n_clusters = st.sidebar.slider("Clusters (KMeans)", 2, 8, 3, 1)
+
+    st.subheader("Preview of Uploaded Data")
+    st.dataframe(df.head(10))
+
+    st.write(f"**Total Rows:** {df.shape[0]:,} | **Columns:** {df.shape[1]}")
+
+    if st.button("Generate Insights", type="primary"):
+        with st.spinner("Analyzing your transactions..."):
+            insights, df_out = analyze_transactions(df, contamination=contamination, n_clusters=n_clusters)
+
+        # Summary metrics
+        st.subheader("Summary Metrics")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Transactions", f"{df_out.shape[0]:,}")
+        c2.metric("Total Spending", f"${df_out['Amount'].sum():,.2f}")
+        c3.metric("Avg Amount", f"${df_out['Amount'].mean():,.2f}")
+        c4.metric("Anomalies", f"{int(df_out['anomaly_flag'].sum()):,}")
+
+        # Key insights
+        st.subheader("Key Insights")
+        st.info("Here's what we found:")
+        for x in insights:
+            st.markdown(f"- {x}")
+
+        # Make a chart-friendly amount column
+        if cap_toggle:
+            df_out["Amount_plot"] = cap_for_chart(df_out["Amount"], cap_q)
+            chart_label = f"Amount (capped at {cap_q:.3f} quantile)"
+        else:
+            df_out["Amount_plot"] = df_out["Amount"]
+            chart_label = "Amount"
+
+        # -----------------------------
+        # Plotly Charts
+        # -----------------------------
+        st.subheader("Interactive Charts (Plotly)")
+
+        # Plotly Histogram
+        st.markdown("### Distribution of Transaction Amounts")
+        fig_hist = px.histogram(
+            df_out,
+            x="Amount_plot",
+            nbins=35,
+            title="Transaction Amount Distribution",
+            labels={"Amount_plot": chart_label},
+        )
+        st.plotly_chart(fig_hist, use_container_width=True)
+
+        # Plotly Boxplot
+        st.markdown("### Transaction Value Spread (Boxplot)")
+        fig_box = px.box(
+            df_out,
+            x="Amount_plot",
+            points="outliers",
+            title="Amount Spread (Capped if enabled)",
+            labels={"Amount_plot": chart_label},
+        )
+        st.plotly_chart(fig_box, use_container_width=True)
+
+        # Plotly Scatter: clusters + anomaly flag
+        st.markdown("### Clustering (KMeans) + Anomalies")
+        tmp = df_out.reset_index(drop=True).copy()
+        tmp["status"] = tmp["anomaly_flag"].map({0: "Normal", 1: "Anomaly"})
+
+        fig_scatter = px.scatter(
+            tmp,
+            x=tmp.index,
+            y="Amount_plot",
+            color="cluster",
+            symbol="status",
+            title="Clusters (color) + Anomalies (symbol)",
+            labels={"Amount_plot": chart_label, "x": "Transaction Index"},
+            hover_data=["Amount", "cluster", "status"],
+            opacity=0.75,
+        )
+        st.plotly_chart(fig_scatter, use_container_width=True)
+
+        # -----------------------------
+        # Tables
+        # -----------------------------
+        st.subheader("Top Transactions (by Amount)")
+        st.dataframe(df_out.sort_values("Amount", ascending=False).head(20))
+
+        st.subheader("Flagged Anomalies (Top 50)")
+        anomalies_df = df_out[df_out["anomaly_flag"] == 1].sort_values("Amount", ascending=False).head(50)
+        st.dataframe(anomalies_df)
+
+        # -----------------------------
+        # PDF Export (below anomalies)
+        # -----------------------------
+        st.subheader("Download Report (PDF)")
+
+        pdf_lines = [
+            f"Transactions: {df_out.shape[0]:,}",
+            f"Total Spending: ${df_out['Amount'].sum():,.2f}",
+            f"Avg Amount: ${df_out['Amount'].mean():,.2f}",
+            f"Anomalies: {int(df_out['anomaly_flag'].sum()):,}",
+        ] + insights
+
+        pdf_bytes = insights_to_pdf_bytes("Financial Insight Generator Report", pdf_lines)
+
+        st.download_button(
+            label="Download PDF report",
+            data=pdf_bytes,
+            file_name="financial_insights_report.pdf",
+            mime="application/pdf",
+        )
+
+except Exception as e:
+    st.error(f"Error processing file: {e}")

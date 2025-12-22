@@ -4,4 +4,4 @@ numpy
 scikit-learn
 plotly
 fpdf2
-openai
+
